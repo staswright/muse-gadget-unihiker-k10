@@ -203,6 +203,24 @@ static void led_task(void *arg)
     }
 }
 
+/* Phase 0 diagnostics (k10-full-features): log every device that ACKs on
+ * the shared I2C bus. The stock port reported the ES7243E mic ADC at
+ * 0x11 "does not answer" without saying what the bus actually held, or
+ * whether the ADC appeared once the I2S clocks were running. These
+ * scans answer both questions from the boot log alone; they change no
+ * behaviour. Remove once the audio bring-up is settled. */
+static void k10_i2c_scan(const char *when)
+{
+    int found = 0;
+    for (int addr = 0x08; addr <= 0x77; addr++) {
+        if (i2c_master_probe(s_i2c, (uint16_t)addr, 20) == ESP_OK) {
+            ESP_LOGI(TAG, "k10diag: %s: device at 0x%02x", when, addr);
+            found++;
+        }
+    }
+    ESP_LOGI(TAG, "k10diag: %s: %d device(s) on the bus", when, found);
+}
+
 static esp_err_t init(void)
 {
     const i2c_master_bus_config_t i2c_cfg = {
@@ -226,6 +244,7 @@ static esp_err_t init(void)
     ESP_RETURN_ON_ERROR(exp_set(PIN_BL, false), TAG, "backlight off");
     ESP_RETURN_ON_ERROR(exp_set(PIN_CAM_RST, false), TAG, "camera reset");
     ESP_RETURN_ON_ERROR(exp_set(PIN_AMP, false), TAG, "amp off");
+    k10_i2c_scan("board init, I2S clocks off");
 
     led_strip_config_t strip_cfg = {
         .strip_gpio_num = LED_GPIO,
@@ -424,16 +443,41 @@ static esp_err_t audio_init(esp_codec_dev_handle_t *spk, esp_codec_dev_handle_t 
     ESP_RETURN_ON_ERROR(i2s_channel_enable(s_tx), TAG, "i2s tx on");
     ESP_RETURN_ON_ERROR(i2s_channel_enable(s_rx), TAG, "i2s rx on");
 
+    /* Phase 0 diagnostics: with MCLK/BCLK/WS now running, sweep the
+     * ES7243E's legal address range. Its 7-bit address is strapped
+     * (0x10-0x17); the stock port assumed 0x11 without probing. Prefer
+     * the assumed address when it ACKs, else the first that does. */
+    k10_i2c_scan("audio init, I2S clocks on");
+    uint8_t adc_addr = ES7243E_ADDR;
+    if (i2c_master_probe(s_i2c, ES7243E_ADDR, 50) != ESP_OK) {
+        adc_addr = 0;
+        for (uint8_t addr = 0x10; addr <= 0x17; addr++) {
+            if (i2c_master_probe(s_i2c, addr, 50) == ESP_OK) {
+                adc_addr = addr;
+                break;
+            }
+        }
+        if (adc_addr) {
+            ESP_LOGW(TAG, "k10diag: ES7243E not at 0x%02x; using 0x%02x instead",
+                     ES7243E_ADDR, adc_addr);
+        } else {
+            ESP_LOGW(TAG, "k10diag: no ES7243E ACK in 0x10-0x17 with I2S clocks on");
+            adc_addr = ES7243E_ADDR;
+        }
+    } else {
+        ESP_LOGI(TAG, "k10diag: ES7243E ACKs at 0x%02x with I2S clocks on", adc_addr);
+    }
+
     audio_codec_i2s_cfg_t i2s_cfg = { .port = I2S_NUM_0, .rx_handle = s_rx, .tx_handle = s_tx };
     s_i2s_if = audio_codec_new_i2s_data(&i2s_cfg);
     ESP_RETURN_ON_FALSE(s_i2s_if, ESP_ERR_NO_MEM, TAG, "i2s data");
 
-    audio_codec_i2c_cfg_t i2c_cfg = { .port = I2C_NUM_0, .addr = ES7243E_ADDR, .bus_handle = s_i2c };
+    audio_codec_i2c_cfg_t i2c_cfg = { .port = I2C_NUM_0, .addr = adc_addr, .bus_handle = s_i2c };
     const audio_codec_ctrl_if_t *ctrl = audio_codec_new_i2c_ctrl(&i2c_cfg);
     ESP_RETURN_ON_FALSE(ctrl, ESP_ERR_NO_MEM, TAG, "es7243e ctrl");
     es7243e_codec_cfg_t adc_cfg = { .ctrl_if = ctrl };
     const audio_codec_if_t *adc = es7243e_codec_new(&adc_cfg);
-    ESP_RETURN_ON_FALSE(adc, ESP_FAIL, TAG, "ES7243E at 0x11 not responding");
+    ESP_RETURN_ON_FALSE(adc, ESP_FAIL, TAG, "ES7243E codec could not be created");
 
     esp_codec_dev_cfg_t out_cfg = { .dev_type = ESP_CODEC_DEV_TYPE_OUT, .data_if = &s_data_if };
     esp_codec_dev_cfg_t in_cfg = {
